@@ -45,7 +45,7 @@ from aiogram.enums import ParseMode
 # TODO: replace with your real token from @BotFather
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-DB_NAME = "experiment7.db"
+DB_NAME = os.getenv("DB_NAME", "experiment.db")
 
 # Allow users to replay the experiment after completing both stages.
 # Set to True if you want participants to be able to run multiple times.
