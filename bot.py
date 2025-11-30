@@ -544,9 +544,11 @@ def record_join_for_fallback(user_id: int) -> None:
 async def ensure_fallback_check_scheduled(bot: Bot) -> None:
     """Schedule a one-time check 60s after the first /join."""
     global fallback_task
+    # If fallback decision is already made, no need to schedule.
     if fallback_mode:
         return
-    if fallback_task is not None:
+    # If a previous task exists and is still running, do nothing.
+    if fallback_task is not None and not fallback_task.done():
         return
     loop = asyncio.get_running_loop()
     fallback_task = loop.create_task(fallback_checker(bot))
@@ -563,90 +565,92 @@ async def fallback_checker(bot: Bot) -> None:
     global fallback_task, fallback_mode, fallback_lb_for_all
 
     try:
-        await asyncio.sleep(60)
-    except asyncio.CancelledError:
-        return
+        # Wait for the 60s window to collect joins
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
 
-    # If already decided or no joined users at all, nothing to do
-    if fallback_mode or not joined_users_since_first:
-        fallback_task = None
-        return
+        # If already decided or no joined users at all, nothing to do
+        if fallback_mode or not joined_users_since_first:
+            return
 
-    # Determine stage-1 users who have actually joined during this waiting window
-    stage1_users: Set[int] = set()
-    for state in participant_states.values():
-        if not state.done and state.current_stage == 1 and get_user_game(state.user_id) is None:
-            if state.user_id in joined_users_since_first:
+        # Determine stage-1 users who have actually joined during this waiting window
+        stage1_users: Set[int] = set()
+        for state in participant_states.values():
+            if (
+                not state.done
+                and state.current_stage == 1
+                and get_user_game(state.user_id) is None
+                and state.user_id in joined_users_since_first
+            ):
                 stage1_users.add(state.user_id)
 
-    # If nobody is waiting for Stage 1, we just enable fallback_mode and return.
-    if not stage1_users:
+        # If nobody is waiting for Stage 1, we just enable fallback_mode and return.
+        if not stage1_users:
+            fallback_mode = True
+            return
+
+        num = len(stage1_users)
+
+        # Decide treatments for these stage-1 users
+        if num < 5:
+            # Case 1: fewer than 5 participants → everyone gets LEADERBOARD first
+            fallback_lb_for_all = True
+            target_lb_users = set(stage1_users)
+            target_nl_users: Set[int] = set()
+        else:
+            # Case 2: 5 or more participants → split approximately equally into LB and NL
+            fallback_lb_for_all = False
+            shuffled = list(stage1_users)
+            random.shuffle(shuffled)
+            half = len(shuffled) // 2
+            # In case of odd numbers, the split will differ by at most 1
+            target_lb_users = set(shuffled[:half])
+            target_nl_users = set(shuffled[half:])
+
+        # Update first_treatment for these users in memory + DB
+        for uid in stage1_users:
+            state = participant_states.get(uid)
+            if not state or state.done or state.current_stage != 1:
+                continue
+            desired = (
+                TREATMENT_LEADERBOARD
+                if uid in target_lb_users
+                else TREATMENT_NO_LEADERBOARD
+            )
+            if state.first_treatment != desired:
+                state.first_treatment = desired
+                await update_experiment_state(state)
+
+        # Rebuild waiting_queues entries for these Stage 1 users so that they sit
+        # in the correct (treatment, stage=1) buckets.
+        for key in list(waiting_queues.keys()):
+            waiting_queues[key] = [
+                uid for uid in waiting_queues[key] if uid not in stage1_users
+            ]
+
+        for uid in stage1_users:
+            state = participant_states.get(uid)
+            if not state or state.done or state.current_stage != 1:
+                continue
+            t = state.first_treatment
+            key = (t, 1)
+            if uid not in waiting_queues[key]:
+                waiting_queues[key].append(uid)
+
+        # From now on we allow starting games with small groups as well
         fallback_mode = True
+
+        # Start any Stage 1/Stage 2 games that are now ready
+        await try_matchmaking(bot)
+
+    except Exception as e:
+        logging.exception("Error in fallback_checker: %s", e)
+    finally:
+        # Always clear the task handle so a new waiting window can be scheduled
+        # in future runs if needed.
         fallback_task = None
-        return
-
-    num = len(stage1_users)
-
-    # Remove all stage-1 users from any existing queues; we will start their games directly.
-    for key in list(waiting_queues.keys()):
-        waiting_queues[key] = [uid for uid in waiting_queues[key] if uid not in stage1_users]
-
-    if num < 5:
-        # Case 1: fewer than 5 participants → everyone gets LEADERBOARD first
-        fallback_lb_for_all = True
-        # Update first_treatment in memory + DB
-        for state in participant_states.values():
-            if state.user_id in stage1_users and not state.done:
-                if state.first_treatment != TREATMENT_LEADERBOARD:
-                    state.first_treatment = TREATMENT_LEADERBOARD
-                    await update_experiment_state(state)
-
-        # Start Stage 1 games for all stage-1 users in groups of up to GROUP_SIZE
-        stage1_list = list(stage1_users)
-        while stage1_list:
-            group = stage1_list[:GROUP_SIZE]
-            stage1_list = stage1_list[GROUP_SIZE:]
-            await start_game(bot, group, TREATMENT_LEADERBOARD, stage=1, is_demo=False)
-    else:
-        # Case 2: 5 or more participants → split approximately equally into LB and NL
-        fallback_lb_for_all = False
-        shuffled = list(stage1_users)
-        random.shuffle(shuffled)
-        half = len(shuffled) // 2
-        group_lb = shuffled[:half]
-        group_nl = shuffled[half:]
-
-        # Update first_treatment for both groups
-        for state in participant_states.values():
-            if state.user_id in group_lb and not state.done:
-                if state.first_treatment != TREATMENT_LEADERBOARD:
-                    state.first_treatment = TREATMENT_LEADERBOARD
-                    await update_experiment_state(state)
-            elif state.user_id in group_nl and not state.done:
-                if state.first_treatment != TREATMENT_NO_LEADERBOARD:
-                    state.first_treatment = TREATMENT_NO_LEADERBOARD
-                    await update_experiment_state(state)
-
-        # Start Stage 1 games for LB group
-        lb_list = list(group_lb)
-        while lb_list:
-            group = lb_list[:GROUP_SIZE]
-            lb_list = lb_list[GROUP_SIZE:]
-            await start_game(bot, group, TREATMENT_LEADERBOARD, stage=1, is_demo=False)
-
-        # Start Stage 1 games for NL group
-        nl_list = list(group_nl)
-        while nl_list:
-            group = nl_list[:GROUP_SIZE]
-            nl_list = nl_list[GROUP_SIZE:]
-            await start_game(bot, group, TREATMENT_NO_LEADERBOARD, stage=1, is_demo=False)
-
-    # From now on we allow starting games with small groups as well
-    fallback_mode = True
-    fallback_task = None
-
-    # Also try to start any Stage 2 games that might already have queues
-    await try_matchmaking(bot)
 
 
 # ---------------------------------------------------------------------------
