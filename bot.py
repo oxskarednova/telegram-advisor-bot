@@ -147,34 +147,23 @@ fallback_lb_for_all: bool = False     # True iff the <5 case was chosen
 
 
 async def maybe_reset_fallback() -> None:
-    """Reset fallback window if no stage-1 participants are currently active.
+    """Reset fallback window if no stage-1 games are currently active in memory.
 
-    This lets us reuse the same DB for multiple experiment runs without
-    forcing future participants into the old fallback decision.
+    We deliberately ignore the DB here: old, abandoned stage-1 records should not
+    prevent new experiment waves from starting with a fresh 60s decision.
     """
     global fallback_mode, fallback_lb_for_all, first_join_time, joined_users_since_first, fallback_task
 
     if not fallback_mode:
         return
 
-    # First check in-memory states
+    # Check in-memory states: if any user is still actively in a Stage 1 game,
+    # we keep the existing fallback decision.
     for state in participant_states.values():
-        if not state.done and state.current_stage == 1:
-            # There is still an active stage-1 participant; do not reset.
+        if not state.done and state.current_stage == 1 and get_user_game(state.user_id):
             return
 
-    # Double-check in DB in case memory state was lost/reloaded.
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute(
-            "SELECT 1 FROM user_experiments WHERE current_stage = 1 AND done = 0 LIMIT 1"
-        ) as cur:
-            row = await cur.fetchone()
-
-    if row:
-        # There is still someone in stage 1 according to DB.
-        return
-
-    # No active stage-1 participants: start a fresh waiting window next time someone joins.
+    # No active Stage 1 games: start a fresh waiting window next time someone joins.
     fallback_mode = False
     fallback_lb_for_all = False
     first_join_time = None
@@ -544,10 +533,9 @@ def record_join_for_fallback(user_id: int) -> None:
 async def ensure_fallback_check_scheduled(bot: Bot) -> None:
     """Schedule a one-time check 60s after the first /join."""
     global fallback_task
-    # If fallback decision is already made, no need to schedule.
     if fallback_mode:
         return
-    # If a previous task exists and is still running, do nothing.
+    # If a previous fallback task exists but has finished (or crashed), allow scheduling a new one.
     if fallback_task is not None and not fallback_task.done():
         return
     loop = asyncio.get_running_loop()
@@ -565,92 +553,90 @@ async def fallback_checker(bot: Bot) -> None:
     global fallback_task, fallback_mode, fallback_lb_for_all
 
     try:
-        # Wait for the 60s window to collect joins
-        try:
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            return
+        await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        return
 
-        # If already decided or no joined users at all, nothing to do
-        if fallback_mode or not joined_users_since_first:
-            return
+    # If already decided or no joined users at all, nothing to do
+    if fallback_mode or not joined_users_since_first:
+        fallback_task = None
+        return
 
-        # Determine stage-1 users who have actually joined during this waiting window
-        stage1_users: Set[int] = set()
-        for state in participant_states.values():
-            if (
-                not state.done
-                and state.current_stage == 1
-                and get_user_game(state.user_id) is None
-                and state.user_id in joined_users_since_first
-            ):
+    # Determine stage-1 users who have actually joined during this waiting window
+    stage1_users: Set[int] = set()
+    for state in participant_states.values():
+        if not state.done and state.current_stage == 1 and get_user_game(state.user_id) is None:
+            if state.user_id in joined_users_since_first:
                 stage1_users.add(state.user_id)
 
-        # If nobody is waiting for Stage 1, we just enable fallback_mode and return.
-        if not stage1_users:
-            fallback_mode = True
-            return
-
-        num = len(stage1_users)
-
-        # Decide treatments for these stage-1 users
-        if num < 5:
-            # Case 1: fewer than 5 participants → everyone gets LEADERBOARD first
-            fallback_lb_for_all = True
-            target_lb_users = set(stage1_users)
-            target_nl_users: Set[int] = set()
-        else:
-            # Case 2: 5 or more participants → split approximately equally into LB and NL
-            fallback_lb_for_all = False
-            shuffled = list(stage1_users)
-            random.shuffle(shuffled)
-            half = len(shuffled) // 2
-            # In case of odd numbers, the split will differ by at most 1
-            target_lb_users = set(shuffled[:half])
-            target_nl_users = set(shuffled[half:])
-
-        # Update first_treatment for these users in memory + DB
-        for uid in stage1_users:
-            state = participant_states.get(uid)
-            if not state or state.done or state.current_stage != 1:
-                continue
-            desired = (
-                TREATMENT_LEADERBOARD
-                if uid in target_lb_users
-                else TREATMENT_NO_LEADERBOARD
-            )
-            if state.first_treatment != desired:
-                state.first_treatment = desired
-                await update_experiment_state(state)
-
-        # Rebuild waiting_queues entries for these Stage 1 users so that they sit
-        # in the correct (treatment, stage=1) buckets.
-        for key in list(waiting_queues.keys()):
-            waiting_queues[key] = [
-                uid for uid in waiting_queues[key] if uid not in stage1_users
-            ]
-
-        for uid in stage1_users:
-            state = participant_states.get(uid)
-            if not state or state.done or state.current_stage != 1:
-                continue
-            t = state.first_treatment
-            key = (t, 1)
-            if uid not in waiting_queues[key]:
-                waiting_queues[key].append(uid)
-
-        # From now on we allow starting games with small groups as well
+    # If nobody is waiting for Stage 1, we just enable fallback_mode and return.
+    if not stage1_users:
         fallback_mode = True
-
-        # Start any Stage 1/Stage 2 games that are now ready
-        await try_matchmaking(bot)
-
-    except Exception as e:
-        logging.exception("Error in fallback_checker: %s", e)
-    finally:
-        # Always clear the task handle so a new waiting window can be scheduled
-        # in future runs if needed.
         fallback_task = None
+        return
+
+    num = len(stage1_users)
+
+    # Remove all stage-1 users from any existing queues; we will start their games directly.
+    for key in list(waiting_queues.keys()):
+        waiting_queues[key] = [uid for uid in waiting_queues[key] if uid not in stage1_users]
+
+    if num < 5:
+        # Case 1: fewer than 5 participants → everyone gets LEADERBOARD first
+        fallback_lb_for_all = True
+        # Update first_treatment in memory + DB
+        for state in participant_states.values():
+            if state.user_id in stage1_users and not state.done:
+                if state.first_treatment != TREATMENT_LEADERBOARD:
+                    state.first_treatment = TREATMENT_LEADERBOARD
+                    await update_experiment_state(state)
+
+        # Start Stage 1 games for all stage-1 users in groups of up to GROUP_SIZE
+        stage1_list = list(stage1_users)
+        while stage1_list:
+            group = stage1_list[:GROUP_SIZE]
+            stage1_list = stage1_list[GROUP_SIZE:]
+            await start_game(bot, group, TREATMENT_LEADERBOARD, stage=1, is_demo=False)
+    else:
+        # Case 2: 5 or more participants → split approximately equally into LB and NL
+        fallback_lb_for_all = False
+        shuffled = list(stage1_users)
+        random.shuffle(shuffled)
+        half = len(shuffled) // 2
+        group_lb = shuffled[:half]
+        group_nl = shuffled[half:]
+
+        # Update first_treatment for both groups
+        for state in participant_states.values():
+            if state.user_id in group_lb and not state.done:
+                if state.first_treatment != TREATMENT_LEADERBOARD:
+                    state.first_treatment = TREATMENT_LEADERBOARD
+                    await update_experiment_state(state)
+            elif state.user_id in group_nl and not state.done:
+                if state.first_treatment != TREATMENT_NO_LEADERBOARD:
+                    state.first_treatment = TREATMENT_NO_LEADERBOARD
+                    await update_experiment_state(state)
+
+        # Start Stage 1 games for LB group
+        lb_list = list(group_lb)
+        while lb_list:
+            group = lb_list[:GROUP_SIZE]
+            lb_list = lb_list[GROUP_SIZE:]
+            await start_game(bot, group, TREATMENT_LEADERBOARD, stage=1, is_demo=False)
+
+        # Start Stage 1 games for NL group
+        nl_list = list(group_nl)
+        while nl_list:
+            group = nl_list[:GROUP_SIZE]
+            nl_list = nl_list[GROUP_SIZE:]
+            await start_game(bot, group, TREATMENT_NO_LEADERBOARD, stage=1, is_demo=False)
+
+    # From now on we allow starting games with small groups as well
+    fallback_mode = True
+    fallback_task = None
+
+    # Also try to start any Stage 2 games that might already have queues
+    await try_matchmaking(bot)
 
 
 # ---------------------------------------------------------------------------
@@ -796,16 +782,15 @@ async def start_new_round(bot: Bot, game: GameSession) -> None:
 
 
 async def round_timeout(bot: Bot, game: GameSession) -> None:
-    """
-    If not all players respond in time, auto-fill missing answers as 'IMPROVE'.
-    """
+    """If not all players respond in time, auto-fill missing answers as 'IMPROVE'."""
     try:
         await asyncio.sleep(ROUND_TIMEOUT_SECONDS)
     except asyncio.CancelledError:
+        # The round finished normally before the timeout expired.
         return
 
-    # If the round has already been closed (e.g. all players voted and
-    # process_round_end has run), do nothing.
+    # If the round has already been closed (e.g. because all players voted and
+    # process_round_end has already run), do nothing.
     if game.round_closed:
         return
 
@@ -814,7 +799,7 @@ async def round_timeout(bot: Bot, game: GameSession) -> None:
         if uid not in game.current_votes:
             game.current_votes[uid] = "IMPROVE"
 
-    # Let process_round_end handle closing the round and progressing the game
+    # Let process_round_end handle closing the round and progressing the game.
     await process_round_end(bot, game)
 
 
@@ -901,78 +886,63 @@ async def finalize_game(bot: Bot, game: GameSession) -> None:
     """
     # Demo games do not affect wallets or stages.
     if game.is_demo:
-        try:
-            for uid in game.players:
-                await bot.send_message(
-                    uid,
-                    "Demo game finished.\n"
-                    "These tokens were for <b>practice only</b> and will not affect payment.\n\n"
-                    "When you're ready, send /join to enter the real experiment.",
-                )
-        finally:
-            # Always free in-memory mappings, even if sending messages fails.
-            for uid in game.players:
-                # Only clear mapping if it still points to this game.
-                if user_game_map.get(uid) == game.id:
-                    user_game_map.pop(uid, None)
-            active_games.pop(game.id, None)
+        for uid in game.players:
+            await bot.send_message(
+                uid,
+                "Demo game finished.\n"
+                "These tokens were for <b>practice only</b> and will not affect payment.\n\n"
+                "When you're ready, send /join to enter the real experiment.",
+            )
+            user_game_map.pop(uid, None)
+        active_games.pop(game.id, None)
         return
 
-    # Real game: record outcome, possibly compute leaderboard bonuses,
-    # notify players, and advance them to the next stage.
-    try:
-        # Mark game finished in DB
-        await mark_game_finished(game.id)
+    # Mark game finished in DB
+    await mark_game_finished(game.id)
 
-        # Leaderboard bonus pool (only for leaderboard treatment)
-        bonus_per_user: Dict[int, float] = {uid: 0.0 for uid in game.players}
-        if game.treatment == TREATMENT_LEADERBOARD and game.players:
-            tokens_list = [game.token_balances.get(uid, 0.0) for uid in game.players]
-            avg_tokens = sum(tokens_list) / len(tokens_list) if tokens_list else 0.0
-            pool = max(avg_tokens, 0.0)
-            if pool > 0.0:
-                # Sort players by tokens descending
-                sorted_players = sorted(
-                    ((uid, game.token_balances.get(uid, 0.0)) for uid in game.players),
-                    key=lambda x: -x[1],
-                )
-                base_winners = max(1, math.ceil(len(sorted_players) / 3))
-                threshold = sorted_players[base_winners - 1][1]
-                winners = [uid for uid, tok in sorted_players if tok >= threshold]
-                if winners:
-                    per_bonus = pool / len(winners)
-                    for uid in winners:
-                        bonus_per_user[uid] = per_bonus
-                        await update_wallet_bonus(uid, game.id, per_bonus)
-
-        # Notify players about final tokens and bonus for this game
-        for uid in game.players:
-            total_tokens = game.token_balances.get(uid, 0.0)
-            bonus = bonus_per_user.get(uid, 0.0)
-            lines = [
-                f"<b>Game finished (Stage {game.stage}, {pretty_treatment(game.treatment)}).</b>",
-                f"Your token profit in this game: <b>{total_tokens:.0f}</b>",
-            ]
-            if game.treatment == TREATMENT_LEADERBOARD:
-                lines.append(
-                    f"Bonus tokens from leaderboard pool: <b>{bonus:.2f}</b>"
-                )
-            lines.append(
-                "These values will be used to compute your final payout across both stages."
+    # Leaderboard bonus pool (only for leaderboard treatment)
+    bonus_per_user: Dict[int, float] = {uid: 0.0 for uid in game.players}
+    if game.treatment == TREATMENT_LEADERBOARD and game.players:
+        tokens_list = [game.token_balances.get(uid, 0.0) for uid in game.players]
+        avg_tokens = sum(tokens_list) / len(tokens_list) if tokens_list else 0.0
+        pool = max(avg_tokens, 0.0)
+        if pool > 0.0:
+            # Sort players by tokens descending
+            sorted_players = sorted(
+                ((uid, game.token_balances.get(uid, 0.0)) for uid in game.players),
+                key=lambda x: -x[1],
             )
-            await bot.send_message(uid, "\n".join(lines))
+            base_winners = max(1, math.ceil(len(sorted_players) / 3))
+            threshold = sorted_players[base_winners - 1][1]
+            winners = [uid for uid, tok in sorted_players if tok >= threshold]
+            if winners:
+                per_bonus = pool / len(winners)
+                for uid in winners:
+                    bonus_per_user[uid] = per_bonus
+                    await update_wallet_bonus(uid, game.id, per_bonus)
 
-        # Move participants to next stage or mark experiment finished
-        await advance_participants_after_game(bot, game)
-    finally:
-        # Always clear in-memory game mappings so users are never stuck
-        # in an 'already in an active game' state if something above fails.
-        # However, only remove a user's mapping if it still points to this game,
-        # to avoid erasing assignments to newer games (e.g. Stage 2).
-        for uid in game.players:
-            if user_game_map.get(uid) == game.id:
-                user_game_map.pop(uid, None)
-        active_games.pop(game.id, None)
+    # Notify players and free mapping
+    for uid in game.players:
+        total_tokens = game.token_balances.get(uid, 0.0)
+        bonus = bonus_per_user.get(uid, 0.0)
+        lines = [
+            f"<b>Game finished (Stage {game.stage}, {pretty_treatment(game.treatment)}).</b>",
+            f"Your token profit in this game: <b>{total_tokens:.0f}</b>",
+        ]
+        if game.treatment == TREATMENT_LEADERBOARD:
+            lines.append(
+                f"Bonus tokens from leaderboard pool: <b>{bonus:.2f}</b>"
+            )
+        lines.append(
+            "These values will be used to compute your final payout across both stages."
+        )
+        await bot.send_message(uid, "\n".join(lines))
+        user_game_map.pop(uid, None)
+
+    active_games.pop(game.id, None)
+
+    # Move participants to next stage or mark experiment finished
+    await advance_participants_after_game(bot, game)
 
 
 async def advance_participants_after_game(bot: Bot, game: GameSession) -> None:
