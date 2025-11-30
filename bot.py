@@ -814,7 +814,6 @@ async def round_timeout(bot: Bot, game: GameSession) -> None:
     await process_round_end(bot, game)
 
 
-
 async def process_round_end(bot: Bot, game: GameSession) -> None:
     """
     Close the round, compute new q, payoffs, and possibly start next round.
@@ -898,63 +897,73 @@ async def finalize_game(bot: Bot, game: GameSession) -> None:
     """
     # Demo games do not affect wallets or stages.
     if game.is_demo:
-        for uid in game.players:
-            await bot.send_message(
-                uid,
-                "Demo game finished.\n"
-                "These tokens were for <b>practice only</b> and will not affect payment.\n\n"
-                "When you're ready, send /join to enter the real experiment.",
-            )
-            user_game_map.pop(uid, None)
-        active_games.pop(game.id, None)
+        try:
+            for uid in game.players:
+                await bot.send_message(
+                    uid,
+                    "Demo game finished.\n"
+                    "These tokens were for <b>practice only</b> and will not affect payment.\n\n"
+                    "When you're ready, send /join to enter the real experiment.",
+                )
+        finally:
+            # Always free in-memory mappings, even if sending messages fails.
+            for uid in game.players:
+                user_game_map.pop(uid, None)
+            active_games.pop(game.id, None)
         return
 
-    # Mark game finished in DB
-    await mark_game_finished(game.id)
+    # Real game: record outcome, possibly compute leaderboard bonuses,
+    # notify players, and advance them to the next stage.
+    try:
+        # Mark game finished in DB
+        await mark_game_finished(game.id)
 
-    # Leaderboard bonus pool (only for leaderboard treatment)
-    bonus_per_user: Dict[int, float] = {uid: 0.0 for uid in game.players}
-    if game.treatment == TREATMENT_LEADERBOARD and game.players:
-        tokens_list = [game.token_balances.get(uid, 0.0) for uid in game.players]
-        avg_tokens = sum(tokens_list) / len(tokens_list) if tokens_list else 0.0
-        pool = max(avg_tokens, 0.0)
-        if pool > 0.0:
-            # Sort players by tokens descending
-            sorted_players = sorted(
-                ((uid, game.token_balances.get(uid, 0.0)) for uid in game.players),
-                key=lambda x: -x[1],
-            )
-            base_winners = max(1, math.ceil(len(sorted_players) / 3))
-            threshold = sorted_players[base_winners - 1][1]
-            winners = [uid for uid, tok in sorted_players if tok >= threshold]
-            if winners:
-                per_bonus = pool / len(winners)
-                for uid in winners:
-                    bonus_per_user[uid] = per_bonus
-                    await update_wallet_bonus(uid, game.id, per_bonus)
+        # Leaderboard bonus pool (only for leaderboard treatment)
+        bonus_per_user: Dict[int, float] = {uid: 0.0 for uid in game.players}
+        if game.treatment == TREATMENT_LEADERBOARD and game.players:
+            tokens_list = [game.token_balances.get(uid, 0.0) for uid in game.players]
+            avg_tokens = sum(tokens_list) / len(tokens_list) if tokens_list else 0.0
+            pool = max(avg_tokens, 0.0)
+            if pool > 0.0:
+                # Sort players by tokens descending
+                sorted_players = sorted(
+                    ((uid, game.token_balances.get(uid, 0.0)) for uid in game.players),
+                    key=lambda x: -x[1],
+                )
+                base_winners = max(1, math.ceil(len(sorted_players) / 3))
+                threshold = sorted_players[base_winners - 1][1]
+                winners = [uid for uid, tok in sorted_players if tok >= threshold]
+                if winners:
+                    per_bonus = pool / len(winners)
+                    for uid in winners:
+                        bonus_per_user[uid] = per_bonus
+                        await update_wallet_bonus(uid, game.id, per_bonus)
 
-    # Notify players and free mapping
-    for uid in game.players:
-        total_tokens = game.token_balances.get(uid, 0.0)
-        bonus = bonus_per_user.get(uid, 0.0)
-        lines = [
-            f"<b>Game finished (Stage {game.stage}, {pretty_treatment(game.treatment)}).</b>",
-            f"Your token profit in this game: <b>{total_tokens:.0f}</b>",
-        ]
-        if game.treatment == TREATMENT_LEADERBOARD:
+        # Notify players about final tokens and bonus for this game
+        for uid in game.players:
+            total_tokens = game.token_balances.get(uid, 0.0)
+            bonus = bonus_per_user.get(uid, 0.0)
+            lines = [
+                f"<b>Game finished (Stage {game.stage}, {pretty_treatment(game.treatment)}).</b>",
+                f"Your token profit in this game: <b>{total_tokens:.0f}</b>",
+            ]
+            if game.treatment == TREATMENT_LEADERBOARD:
+                lines.append(
+                    f"Bonus tokens from leaderboard pool: <b>{bonus:.2f}</b>"
+                )
             lines.append(
-                f"Bonus tokens from leaderboard pool: <b>{bonus:.2f}</b>"
+                "These values will be used to compute your final payout across both stages."
             )
-        lines.append(
-            "These values will be used to compute your final payout across both stages."
-        )
-        await bot.send_message(uid, "\n".join(lines))
-        user_game_map.pop(uid, None)
+            await bot.send_message(uid, "\n".join(lines))
 
-    active_games.pop(game.id, None)
-
-    # Move participants to next stage or mark experiment finished
-    await advance_participants_after_game(bot, game)
+        # Move participants to next stage or mark experiment finished
+        await advance_participants_after_game(bot, game)
+    finally:
+        # Always clear in-memory game mappings so users are never stuck
+        # in an 'already in an active game' state if something above fails.
+        for uid in game.players:
+            user_game_map.pop(uid, None)
+        active_games.pop(game.id, None)
 
 
 async def advance_participants_after_game(bot: Bot, game: GameSession) -> None:
