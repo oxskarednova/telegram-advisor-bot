@@ -62,6 +62,13 @@ TREATMENT_LEADERBOARD = "leaderboard"
 TREATMENT_NO_LEADERBOARD = "no_leaderboard"
 TREATMENTS = (TREATMENT_LEADERBOARD, TREATMENT_NO_LEADERBOARD)
 
+# Admin Telegram user id (set via Render env var ADMIN_ID)
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # 0 means “no admin configured”
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
 # ---------------------------------------------------------------------------
 # DATA CLASSES
 # ---------------------------------------------------------------------------
@@ -1146,6 +1153,29 @@ async def handle_vote(callback: types.CallbackQuery) -> None:
 
     if len(game.current_votes) == len(game.players):
         await process_round_end(callback.message.bot, game)
+
+
+
+
+@router.message(Command("export_db"))
+async def cmd_export_db(message: types.Message) -> None:
+    """
+    Admin-only: send the raw SQLite database file as a document.
+    """
+    user_id = message.from_user.id
+
+    if not is_admin(user_id):
+        await message.answer("You are not authorized to use this command.")
+        return
+
+    if not os.path.exists(DB_NAME):
+        await message.answer("Database file not found on the server.")
+        return
+
+    await message.answer_document(
+        types.FSInputFile(DB_NAME),
+        caption=f"SQLite database: {DB_NAME}",
+    )
 
 
 # ---------------------------------------------------------------------------
