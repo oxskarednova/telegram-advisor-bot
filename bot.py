@@ -800,15 +800,19 @@ async def round_timeout(bot: Bot, game: GameSession) -> None:
     except asyncio.CancelledError:
         return
 
+    # If the round has already been closed (e.g. all players voted and
+    # process_round_end has run), do nothing.
     if game.round_closed:
         return
 
-    game.round_closed = True
+    # Auto-fill missing votes as 'IMPROVE' for all players who didn't act
     for uid in game.players:
         if uid not in game.current_votes:
             game.current_votes[uid] = "IMPROVE"
 
+    # Let process_round_end handle closing the round and progressing the game
     await process_round_end(bot, game)
+
 
 
 async def process_round_end(bot: Bot, game: GameSession) -> None:
