@@ -908,7 +908,9 @@ async def finalize_game(bot: Bot, game: GameSession) -> None:
         finally:
             # Always free in-memory mappings, even if sending messages fails.
             for uid in game.players:
-                user_game_map.pop(uid, None)
+                # Only clear mapping if it still points to this game.
+                if user_game_map.get(uid) == game.id:
+                    user_game_map.pop(uid, None)
             active_games.pop(game.id, None)
         return
 
@@ -961,8 +963,11 @@ async def finalize_game(bot: Bot, game: GameSession) -> None:
     finally:
         # Always clear in-memory game mappings so users are never stuck
         # in an 'already in an active game' state if something above fails.
+        # However, only remove a user's mapping if it still points to this game,
+        # to avoid erasing assignments to newer games (e.g. Stage 2).
         for uid in game.players:
-            user_game_map.pop(uid, None)
+            if user_game_map.get(uid) == game.id:
+                user_game_map.pop(uid, None)
         active_games.pop(game.id, None)
 
 
